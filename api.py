@@ -3,12 +3,19 @@
 
 import abc
 import json
-import datetime
 import logging
 import hashlib
 import uuid
 from optparse import OptionParser
-from BaseHTTPServer import HTTPServer, BaseHTTPRequestHandler
+from http.server import HTTPServer, BaseHTTPRequestHandler
+from collections import OrderedDict
+import re
+from datetime import datetime
+from collections import defaultdict
+
+from itertools import chain
+
+import scoring
 
 SALT = "Otus"
 ADMIN_LOGIN = "admin"
@@ -36,44 +43,186 @@ GENDERS = {
 }
 
 
-class CharField(object):
-    pass
+class Field:
+    def __init__(self, null_values=[''], required=False, nullable=False):
+        self.required = required
+        self.nullable = nullable
+        self.null_values = null_values
+        self.validators = []
+
+    def valid(self, value):
+        if value is None:
+            return not self.required
+        elif value in self.null_values:
+            return self.nullable
+        else:
+            for v in self.validators:
+                if not v(value):
+                    return False
+        return True
 
 
-class ArgumentsField(object):
-    pass
+class CharField(Field):
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.validators.append(CharField.is_string)
+
+    @staticmethod
+    def is_string(value):
+        return isinstance(value, str)
+
+
+class ArgumentsField(Field):
+    def __init__(self, **kwargs):
+        super().__init__(null_values=[{}], **kwargs)
+        self.validators.append(ArgumentsField.is_dict)
+
+    @staticmethod
+    def is_dict(value):
+        return isinstance(value, dict)
 
 
 class EmailField(CharField):
-    pass
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.validators.append(EmailField.is_email)
+
+    @staticmethod
+    def is_email(value):
+        return '@' in value
 
 
-class PhoneField(object):
-    pass
+class PhoneField(Field):
+    def __init__(self, **kwargs):
+        super().__init__(null_values=["", 0], **kwargs)
+        self.validators.append(PhoneField.is_phone)
+
+    @staticmethod
+    def is_phone(value):
+        if isinstance(value, (str, int)):
+            value = str(value)
+            return re.match(r'7\d{10}$', value) is not None
+        return False
 
 
-class DateField(object):
-    pass
+class DateField(Field):
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.validators.append(DateField.is_date)
+
+    @staticmethod
+    def is_date(value):
+        try:
+            date = datetime.strptime(value, "%d.%m.%Y")
+        except ValueError:
+            return False
+        return True
 
 
-class BirthDayField(object):
-    pass
+class BirthDayField(Field):
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.validators.append(BirthDayField.is_birthday)
+
+    @staticmethod
+    def is_birthday(value):
+        try:
+            date = datetime.strptime(value, "%d.%m.%Y")
+            cur_date = datetime.now()
+            delta = cur_date - date
+            if delta.days > 0 and delta.days < 70*365:
+                return True
+        except ValueError:
+            pass
+        return False
 
 
-class GenderField(object):
-    pass
+class GenderField(Field):
+    def __init__(self, **kwargs):
+        super().__init__(null_values=[None], **kwargs)
+        self.validators.append(GenderField.is_gender)
+
+    @staticmethod
+    def is_gender(value):
+        if isinstance(value, int) and value in GENDERS:
+            return True
+        return False
 
 
-class ClientIDsField(object):
-    pass
+class ClientIDsField(Field):
+    def __init__(self, **kwargs):
+        super().__init__(null_values=[[]], **kwargs)
+        self.validators.append(ClientIDsField.is_id)
+
+    @staticmethod
+    def is_id(value):
+        if isinstance(value, list):
+            return all(isinstance(v, int) for v in value)
+        return False
 
 
-class ClientsInterestsRequest(object):
+class DeclarativeFields(type):
+    """Collect Fields declared on the base classes."""
+    def __new__(mcs, name, bases, attrs):
+        fields = []
+        for key, value in list(attrs.items()):
+            if isinstance(value, Field):
+                fields.append((key, value))
+                attrs.pop(key)
+        attrs['fields'] = OrderedDict(fields)
+
+        return super(DeclarativeFields, mcs).__new__(mcs, name, bases, attrs)
+
+
+class BaseRequest:
+    def __init__(self, data=None):
+        self.data = data
+        self.errors = []
+        self.login = data.get("login")
+        self.account = data.get("account")
+        self.token = data.get("token")
+        self.pair_fields = []
+
+    def is_valid(self):
+        self.errors = []
+        for field_name, field in self.fields.items():
+            field_data = self.data.get(field_name)
+            if not field.valid(field_data):
+                self.errors.append(field_name + " invalid")
+                logging.error("{}: invalid".format(field_name))
+        if self.errors:
+            return False
+
+        if self.pair_fields:
+            return self.check_pair()
+        return not self.errors
+
+    def check_pair(self):
+        for f1, f2 in self.pair_fields:
+            d1 = self.data.get(f1)
+            d2 = self.data.get(f2)
+
+            if (d1 is not None and d2 is not None and
+                    d1 not in self.fields[f1].null_values and
+                    d2 not in self.fields[f2].null_values):
+                return True
+
+        self.errors.append("The are not invalid pair fields")
+        return False
+
+
+class ClientsInterestsRequest(BaseRequest, metaclass=DeclarativeFields):
     client_ids = ClientIDsField(required=True)
     date = DateField(required=False, nullable=True)
 
+    def get_response(self, ctx, store, args, is_admin=False):
+        ctx["nclients"] = len(args.get('client_ids'))
+        ids = args.get('client_ids')
+        r = {i: scoring.get_interests(store, i) for i in ids}
+        return r, OK
 
-class OnlineScoreRequest(object):
+
+class OnlineScoreRequest(BaseRequest, metaclass=DeclarativeFields):
     first_name = CharField(required=False, nullable=True)
     last_name = CharField(required=False, nullable=True)
     email = EmailField(required=False, nullable=True)
@@ -81,8 +230,22 @@ class OnlineScoreRequest(object):
     birthday = BirthDayField(required=False, nullable=True)
     gender = GenderField(required=False, nullable=True)
 
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.pair_fields = [("phone", "email"),
+                            ("first_name", "last_name"),
+                            ("gender", "birthday")]
 
-class MethodRequest(object):
+    def get_response(self, ctx, store, args, is_admin=False):
+        ctx["has"] = [f for f in args]
+        score = 42
+        if not is_admin:
+            score = scoring.get_score(store, args.get('phone'),
+                                      args.get('email'), args)
+        return {"score": score}, OK
+
+
+class MethodRequest(BaseRequest, metaclass=DeclarativeFields):
     account = CharField(required=False, nullable=True)
     login = CharField(required=True, nullable=True)
     token = CharField(required=True, nullable=True)
@@ -96,17 +259,41 @@ class MethodRequest(object):
 
 def check_auth(request):
     if request.is_admin:
-        digest = hashlib.sha512(datetime.datetime.now().strftime("%Y%m%d%H") + ADMIN_SALT).hexdigest()
+        date = datetime.now().strftime("%Y%m%d%H") + ADMIN_SALT
+        digest = hashlib.sha512(date.encode('utf-8')).hexdigest()
     else:
-        digest = hashlib.sha512(request.account + request.login + SALT).hexdigest()
+        date = request.account + request.login + SALT
+        digest = hashlib.sha512(date.encode('utf-8')).hexdigest()
     if digest == request.token:
         return True
     return False
 
 
 def method_handler(request, ctx, store):
-    response, code = None, None
-    return response, code
+    router = {
+        "online_score": OnlineScoreRequest,
+        "clients_interests": ClientsInterestsRequest
+    }
+    logging.info("request: {}".format(request))
+
+    req_body = request.get('body')
+    req_args = req_body.get('arguments')
+    req_method = req_body.get('method')
+
+    req_base = MethodRequest(req_body)
+    if not req_base.is_valid():
+        return ERRORS[INVALID_REQUEST], INVALID_REQUEST
+    if not check_auth(req_base):
+        return ERRORS[FORBIDDEN], FORBIDDEN
+
+    try:
+        req = router[req_method](req_args)
+        if not req.is_valid():
+            return ",".join(req.errors), INVALID_REQUEST
+    except KeyError:
+        return ERRORS[INVALID_REQUEST], INVALID_REQUEST
+
+    return req.get_response(ctx, store, req_args, req_base.is_admin)
 
 
 class MainHTTPHandler(BaseHTTPRequestHandler):
@@ -124,17 +311,17 @@ class MainHTTPHandler(BaseHTTPRequestHandler):
         request = None
         try:
             data_string = self.rfile.read(int(self.headers['Content-Length']))
-            request = json.loads(data_string)
-        except:
+            request = json.loads(data_string.decode("utf-8") )
+        except Exception as e:
+            logging.exception("Unexpected error: %s" % e)
             code = BAD_REQUEST
-
         if request:
             path = self.path.strip("/")
             logging.info("%s: %s %s" % (self.path, data_string, context["request_id"]))
             if path in self.router:
                 try:
                     response, code = self.router[path]({"body": request, "headers": self.headers}, context, self.store)
-                except Exception, e:
+                except Exception as e:
                     logging.exception("Unexpected error: %s" % e)
                     code = INTERNAL_ERROR
             else:
@@ -149,7 +336,7 @@ class MainHTTPHandler(BaseHTTPRequestHandler):
             r = {"error": response or ERRORS.get(code, "Unknown Error"), "code": code}
         context.update(r)
         logging.info(context)
-        self.wfile.write(json.dumps(r))
+        self.wfile.write(json.dumps(r).encode('utf-8'))
         return
 
 
