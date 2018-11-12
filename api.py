@@ -178,18 +178,19 @@ class BaseRequest:
     def __init__(self, data=None):
         self.data = data
         self.errors = []
-        self.login = data.get("login")
-        self.account = data.get("account")
-        self.token = data.get("token")
         self.pair_fields = []
+
+    def __getattr__(self, attr):
+        return self.data.get(attr)
+
 
     def is_valid(self):
         self.errors = []
         for field_name, field in self.fields.items():
             field_data = self.data.get(field_name)
             if not field.valid(field_data):
-                self.errors.append(field_name + " invalid")
-                logging.error("{}: invalid".format(field_name))
+                self.errors.append("{}:{} invalid".format(field_name, field_data))
+                logging.error("{}:{} invalid".format(field_name, field_data))
         if self.errors:
             return False
 
