@@ -12,7 +12,6 @@ from collections import OrderedDict
 import re
 from datetime import datetime
 from collections import defaultdict
-
 from itertools import chain
 
 import scoring
@@ -44,7 +43,7 @@ GENDERS = {
 
 
 class Field:
-    def __init__(self, null_values=[''], required=False, nullable=False):
+    def __init__(self, null_values=[''], required=True, nullable=False):
         self.required = required
         self.nullable = nullable
         self.null_values = null_values
@@ -175,19 +174,18 @@ class DeclarativeFields(type):
 
 
 class BaseRequest:
-    def __init__(self, data=None):
-        self.data = data
+    def __init__(self, req_args=None):
+        self.req_args = req_args
         self.errors = []
         self.pair_fields = []
 
     def __getattr__(self, attr):
-        return self.data.get(attr)
-
+        return self.req_args.get(attr)
 
     def is_valid(self):
         self.errors = []
         for field_name, field in self.fields.items():
-            field_data = self.data.get(field_name)
+            field_data = self.req_args.get(field_name)
             if not field.valid(field_data):
                 self.errors.append("{}:{} invalid".format(field_name, field_data))
                 logging.error("{}:{} invalid".format(field_name, field_data))
@@ -200,15 +198,15 @@ class BaseRequest:
 
     def check_pair(self):
         for f1, f2 in self.pair_fields:
-            d1 = self.data.get(f1)
-            d2 = self.data.get(f2)
+            d1 = self.req_args.get(f1)
+            d2 = self.req_args.get(f2)
 
             if (d1 is not None and d2 is not None and
                     d1 not in self.fields[f1].null_values and
                     d2 not in self.fields[f2].null_values):
                 return True
 
-        self.errors.append("The are not invalid pair fields")
+        self.errors.append("The are no invalid pair fields")
         return False
 
 
@@ -216,9 +214,9 @@ class ClientsInterestsRequest(BaseRequest, metaclass=DeclarativeFields):
     client_ids = ClientIDsField(required=True)
     date = DateField(required=False, nullable=True)
 
-    def get_response(self, ctx, store, args, is_admin=False):
-        ctx["nclients"] = len(args.get('client_ids'))
-        ids = args.get('client_ids')
+    def get_response(self, ctx, store, is_admin=False):
+        ctx["nclients"] = len(self.client_ids)
+        ids = self.client_ids
         r = {i: scoring.get_interests(store, i) for i in ids}
         return r, OK
 
@@ -237,12 +235,13 @@ class OnlineScoreRequest(BaseRequest, metaclass=DeclarativeFields):
                             ("first_name", "last_name"),
                             ("gender", "birthday")]
 
-    def get_response(self, ctx, store, args, is_admin=False):
-        ctx["has"] = [f for f in args]
+    def get_response(self, ctx, store, is_admin=False):
+        ctx["has"] = [f for f in self.req_args if f not in self.fields[f].null_values]
         score = 42
         if not is_admin:
-            score = scoring.get_score(store, args.get('phone'),
-                                      args.get('email'), args)
+            score = scoring.get_score(store, self.phone, self.email,
+                                      self.birthday, self.gender,
+                                      self.first_name, self.last_name)
         return {"score": score}, OK
 
 
@@ -294,7 +293,7 @@ def method_handler(request, ctx, store):
     except KeyError:
         return ERRORS[INVALID_REQUEST], INVALID_REQUEST
 
-    return req.get_response(ctx, store, req_args, req_base.is_admin)
+    return req.get_response(ctx, store, req_base.is_admin)
 
 
 class MainHTTPHandler(BaseHTTPRequestHandler):
@@ -312,7 +311,7 @@ class MainHTTPHandler(BaseHTTPRequestHandler):
         request = None
         try:
             data_string = self.rfile.read(int(self.headers['Content-Length']))
-            request = json.loads(data_string.decode("utf-8") )
+            request = json.loads(data_string.decode("utf-8"))
         except Exception as e:
             logging.exception("Unexpected error: %s" % e)
             code = BAD_REQUEST
