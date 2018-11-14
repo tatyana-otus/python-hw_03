@@ -42,122 +42,119 @@ GENDERS = {
 }
 
 
+class ValidationError(Exception):
+    pass
+
+
 class Field:
     def __init__(self, null_values=[''], required=True, nullable=False):
         self.required = required
         self.nullable = nullable
         self.null_values = null_values
-        self.validators = []
 
     def valid(self, value):
         if value is None:
             return not self.required
         elif value in self.null_values:
             return self.nullable
-        else:
-            for v in self.validators:
-                if not v(value):
-                    return False
+        try:
+            self.validate(value)
+        except ValidationError:
+            return False
         return True
+
+    def validate(self, value):
+        pass
 
 
 class CharField(Field):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
-        self.validators.append(CharField.is_string)
 
-    @staticmethod
-    def is_string(value):
-        return isinstance(value, str)
+    def validate(self, value):
+        super().validate(value)
+        if not isinstance(value, str):
+            raise ValidationError
 
 
 class ArgumentsField(Field):
     def __init__(self, **kwargs):
         super().__init__(null_values=[{}], **kwargs)
-        self.validators.append(ArgumentsField.is_dict)
 
-    @staticmethod
-    def is_dict(value):
-        return isinstance(value, dict)
+    def validate(self, value):
+        super().validate(value)
+        if not isinstance(value, dict):
+            raise ValidationError
 
 
 class EmailField(CharField):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
-        self.validators.append(EmailField.is_email)
 
-    @staticmethod
-    def is_email(value):
-        return '@' in value
+    def validate(self, value):
+        super().validate(value)
+        if '@' not in value:
+            raise ValidationError
 
 
 class PhoneField(Field):
     def __init__(self, **kwargs):
         super().__init__(null_values=["", 0], **kwargs)
-        self.validators.append(PhoneField.is_phone)
 
-    @staticmethod
-    def is_phone(value):
-        if isinstance(value, (str, int)):
-            value = str(value)
-            return re.match(r'7\d{10}$', value) is not None
-        return False
+    def validate(self, value):
+        super().validate(value)
+        if not isinstance(value, (str, int)):
+            raise ValidationError
+        value = str(value)
+        if re.match(r'7\d{10}$', value) is None:
+            raise ValidationError
 
 
 class DateField(Field):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
-        self.validators.append(DateField.is_date)
 
-    @staticmethod
-    def is_date(value):
+    def validate(self, value):
+        super().validate(value)
         try:
             date = datetime.strptime(value, "%d.%m.%Y")
         except ValueError:
-            return False
-        return True
+            raise ValidationError
 
 
-class BirthDayField(Field):
+class BirthDayField(DateField):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
-        self.validators.append(BirthDayField.is_birthday)
 
-    @staticmethod
-    def is_birthday(value):
-        try:
-            date = datetime.strptime(value, "%d.%m.%Y")
-            cur_date = datetime.now()
-            delta = cur_date - date
-            if delta.days > 0 and delta.days < 70*365:
-                return True
-        except ValueError:
-            pass
-        return False
+    def validate(self, value):
+        super().validate(value)
+        delta = datetime.now() - datetime.strptime(value, "%d.%m.%Y")
+        if delta.days < 0 or delta.days > 70*365:
+            raise ValidationError
 
 
 class GenderField(Field):
     def __init__(self, **kwargs):
         super().__init__(null_values=[None], **kwargs)
-        self.validators.append(GenderField.is_gender)
 
-    @staticmethod
-    def is_gender(value):
-        if isinstance(value, int) and value in GENDERS:
-            return True
-        return False
+    def validate(self, value):
+        super().validate(value)
+        if not isinstance(value, int):
+            raise ValidationError
+        if value not in GENDERS:
+            raise ValidationError
 
 
 class ClientIDsField(Field):
     def __init__(self, **kwargs):
         super().__init__(null_values=[[]], **kwargs)
-        self.validators.append(ClientIDsField.is_id)
 
-    @staticmethod
-    def is_id(value):
-        if isinstance(value, list):
-            return all(isinstance(v, int) for v in value)
-        return False
+    def validate(self, value):
+        super().validate(value)
+        if not isinstance(value, list):
+            raise ValidationError
+        if not all(isinstance(v, int) for v in value):
+            raise ValidationError
 
 
 class DeclarativeFields(type):
@@ -173,11 +170,10 @@ class DeclarativeFields(type):
         return super(DeclarativeFields, mcs).__new__(mcs, name, bases, attrs)
 
 
-class BaseRequest:
+class BaseRequest(metaclass=DeclarativeFields):
     def __init__(self, req_args=None):
         self.req_args = req_args
         self.errors = []
-        self.pair_fields = []
 
     def __getattr__(self, attr):
         return self.req_args.get(attr)
@@ -187,17 +183,45 @@ class BaseRequest:
         for field_name, field in self.fields.items():
             field_data = self.req_args.get(field_name)
             if not field.valid(field_data):
-                self.errors.append("{}:{} invalid".format(field_name, field_data))
+                self.errors.append("{}:{} invalid".format(field_name,
+                                                          field_data))
                 logging.error("{}:{} invalid".format(field_name, field_data))
-        if self.errors:
-            return False
-
-        if self.pair_fields:
-            return self.check_pair()
         return not self.errors
 
+
+class ClientsInterestsRequest(BaseRequest):
+    client_ids = ClientIDsField(required=True)
+    date = DateField(required=False, nullable=True)
+
+    def get_response(self, ctx, store, is_admin=False):
+        ctx["nclients"] = len(self.client_ids)
+        ids = self.client_ids
+        r = {i: scoring.get_interests(store, i) for i in ids}
+        return r, OK
+
+
+class OnlineScoreRequest(BaseRequest):
+    first_name = CharField(required=False, nullable=True)
+    last_name = CharField(required=False, nullable=True)
+    email = EmailField(required=False, nullable=True)
+    phone = PhoneField(required=False, nullable=True)
+    birthday = BirthDayField(required=False, nullable=True)
+    gender = GenderField(required=False, nullable=True)
+
+    pair_fields = [("phone", "email"),
+                   ("first_name", "last_name"),
+                   ("gender", "birthday")]
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+
+    def is_valid(self):
+        if not super().is_valid():
+            return False
+        return self.check_pair()
+
     def check_pair(self):
-        for f1, f2 in self.pair_fields:
+        for f1, f2 in type(self).pair_fields:
             d1 = self.req_args.get(f1)
             d2 = self.req_args.get(f2)
 
@@ -209,32 +233,6 @@ class BaseRequest:
         self.errors.append("The are no invalid pair fields")
         return False
 
-
-class ClientsInterestsRequest(BaseRequest, metaclass=DeclarativeFields):
-    client_ids = ClientIDsField(required=True)
-    date = DateField(required=False, nullable=True)
-
-    def get_response(self, ctx, store, is_admin=False):
-        ctx["nclients"] = len(self.client_ids)
-        ids = self.client_ids
-        r = {i: scoring.get_interests(store, i) for i in ids}
-        return r, OK
-
-
-class OnlineScoreRequest(BaseRequest, metaclass=DeclarativeFields):
-    first_name = CharField(required=False, nullable=True)
-    last_name = CharField(required=False, nullable=True)
-    email = EmailField(required=False, nullable=True)
-    phone = PhoneField(required=False, nullable=True)
-    birthday = BirthDayField(required=False, nullable=True)
-    gender = GenderField(required=False, nullable=True)
-
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.pair_fields = [("phone", "email"),
-                            ("first_name", "last_name"),
-                            ("gender", "birthday")]
-
     def get_response(self, ctx, store, is_admin=False):
         ctx["has"] = [f for f in self.req_args if f not in self.fields[f].null_values]
         score = 42
@@ -245,7 +243,7 @@ class OnlineScoreRequest(BaseRequest, metaclass=DeclarativeFields):
         return {"score": score}, OK
 
 
-class MethodRequest(BaseRequest, metaclass=DeclarativeFields):
+class MethodRequest(BaseRequest):
     account = CharField(required=False, nullable=True)
     login = CharField(required=True, nullable=True)
     token = CharField(required=True, nullable=True)
@@ -276,22 +274,18 @@ def method_handler(request, ctx, store):
     }
     logging.info("request: {}".format(request))
 
-    req_body = request.get('body')
-    req_args = req_body.get('arguments')
-    req_method = req_body.get('method')
-
-    req_base = MethodRequest(req_body)
+    req_base = MethodRequest(request.get('body'))
     if not req_base.is_valid():
-        return ERRORS[INVALID_REQUEST], INVALID_REQUEST
+        return ",".join(req_base.errors), INVALID_REQUEST
     if not check_auth(req_base):
-        return ERRORS[FORBIDDEN], FORBIDDEN
+        return "", FORBIDDEN
 
     try:
-        req = router[req_method](req_args)
+        req = router[req_base.method](req_base.arguments)
         if not req.is_valid():
             return ",".join(req.errors), INVALID_REQUEST
     except KeyError:
-        return ERRORS[INVALID_REQUEST], INVALID_REQUEST
+        return "", NOT_FOUND
 
     return req.get_response(ctx, store, req_base.is_admin)
 
