@@ -13,6 +13,7 @@ import re
 from datetime import datetime
 from collections import defaultdict
 from itertools import chain
+import operator
 
 import scoring
 
@@ -51,30 +52,31 @@ class Field:
         self.required = required
         self.nullable = nullable
         self.null_values = null_values
+        self.clean_data = None
 
     def valid(self, value):
         if value is None:
             return not self.required
         elif value in self.null_values:
+            self.clean_data = value
             return self.nullable
         try:
-            self.validate(value)
+            self.clean_data = self.validate(value)
         except ValidationError:
             return False
         return True
 
     def validate(self, value):
-        pass
+        return value
 
 
 class CharField(Field):
-    def __init__(self, **kwargs):
-        super().__init__(**kwargs)
 
     def validate(self, value):
-        super().validate(value)
+        value = super().validate(value)
         if not isinstance(value, str):
             raise ValidationError
+        return value
 
 
 class ArgumentsField(Field):
@@ -82,19 +84,19 @@ class ArgumentsField(Field):
         super().__init__(null_values=[{}], **kwargs)
 
     def validate(self, value):
-        super().validate(value)
+        value = super().validate(value)
         if not isinstance(value, dict):
             raise ValidationError
+        return value
 
 
 class EmailField(CharField):
-    def __init__(self, **kwargs):
-        super().__init__(**kwargs)
 
     def validate(self, value):
-        super().validate(value)
+        value = super().validate(value)
         if '@' not in value:
             raise ValidationError
+        return value
 
 
 class PhoneField(Field):
@@ -102,47 +104,47 @@ class PhoneField(Field):
         super().__init__(null_values=["", 0], **kwargs)
 
     def validate(self, value):
-        super().validate(value)
+        value = super().validate(value)
         if not isinstance(value, (str, int)):
             raise ValidationError
         value = str(value)
         if re.match(r'7\d{10}$', value) is None:
             raise ValidationError
+        return value
 
 
-class DateField(Field):
-    def __init__(self, **kwargs):
-        super().__init__(**kwargs)
+class DateField(CharField):
 
     def validate(self, value):
-        super().validate(value)
+        value = super().validate(value)
         try:
             date = datetime.strptime(value, "%d.%m.%Y")
         except ValueError:
             raise ValidationError
+        return date
 
 
 class BirthDayField(DateField):
-    def __init__(self, **kwargs):
-        super().__init__(**kwargs)
 
     def validate(self, value):
-        super().validate(value)
-        delta = datetime.now() - datetime.strptime(value, "%d.%m.%Y")
+        value = super().validate(value)
+        delta = datetime.now() - value
         if delta.days < 0 or delta.days > 70*365:
             raise ValidationError
+        return value
 
 
 class GenderField(Field):
     def __init__(self, **kwargs):
-        super().__init__(null_values=[None], **kwargs)
+        super().__init__(null_values=[], **kwargs)
 
     def validate(self, value):
-        super().validate(value)
+        value = super().validate(value)
         if not isinstance(value, int):
             raise ValidationError
         if value not in GENDERS:
             raise ValidationError
+        return value
 
 
 class ClientIDsField(Field):
@@ -150,11 +152,12 @@ class ClientIDsField(Field):
         super().__init__(null_values=[[]], **kwargs)
 
     def validate(self, value):
-        super().validate(value)
+        value = super().validate(value)
         if not isinstance(value, list):
             raise ValidationError
-        if not all(isinstance(v, int) for v in value):
+        if not all(isinstance(v, int) and v >= 0 for v in value):
             raise ValidationError
+        return value
 
 
 class DeclarativeFields(type):
@@ -176,7 +179,10 @@ class BaseRequest(metaclass=DeclarativeFields):
         self.errors = []
 
     def __getattr__(self, attr):
-        return self.req_args.get(attr)
+        if attr in self.fields:
+            field = self.fields[attr]
+            return field.clean_data
+        return None
 
     def is_valid(self):
         self.errors = []
